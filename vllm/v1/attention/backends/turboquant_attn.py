@@ -12,6 +12,7 @@ from typing import ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
@@ -1069,8 +1070,9 @@ class TurboQuantAttentionImpl(AttentionImpl):
             attn_query, k_state.sign_flips, output_dtype=torch.float16,
         )
 
-        # Decode-only attention in rotated domain.
-        num_kv_splits = 4
+        # For batch invariance, use only 1 split to ensure deterministic
+        # reduction.
+        num_kv_splits = 1 if envs.VLLM_BATCH_INVARIANT else 4
         decode_output, lse, attn_logits = (
             self._get_turboquant_decode_buffers(
                 layer, batch_size, num_query_heads, head_size,
