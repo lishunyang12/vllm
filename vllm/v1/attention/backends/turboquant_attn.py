@@ -961,6 +961,43 @@ class TurboQuantAttentionImpl(AttentionImpl):
     # ------------------------------------------------------------------
 
     @torch.compiler.disable
+    def _use_turboquant_block_dedup(self) -> bool:
+        """Dedup blocks only when the current forward can tolerate reshapes."""
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import (
+            get_forward_context,
+            is_forward_context_available,
+        )
+
+        if not is_forward_context_available():
+            return True
+
+        return get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
+
+    @torch.compiler.disable
+    def _get_static_turboquant_blocks(
+        self,
+        block_table: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the original block layout with a cached identity remap."""
+        flat_bt = block_table.reshape(-1)
+        cache_key = (
+            block_table.shape,
+            block_table.device,
+            block_table.dtype,
+        )
+        if not hasattr(self, "_bt_cache") or self._bt_cache[0] != cache_key:
+            self._bt_cache = (
+                cache_key,
+                torch.arange(
+                    flat_bt.shape[0],
+                    device=block_table.device,
+                    dtype=block_table.dtype,
+                ).reshape(block_table.shape),
+            )
+        return flat_bt, self._bt_cache[1]
+
+    @torch.compiler.disable
     def _get_live_turboquant_blocks(
         self,
         block_table: torch.Tensor,
@@ -973,6 +1010,11 @@ class TurboQuantAttentionImpl(AttentionImpl):
         and hybrid layouts can leave trailing block slots unused.
         This deduplicates to minimize the number of blocks decoded.
         """
+        if not self._use_turboquant_block_dedup():
+            # CUDA graph replay requires decode tensor shapes to stay fixed for
+            # a captured batch shape, so keep the original block layout there.
+            return self._get_static_turboquant_blocks(block_table)
+
         if seq_lens is None:
             flat_bt = block_table.reshape(-1)
             unique_block_ids, remapped = torch.unique(
