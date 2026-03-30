@@ -226,6 +226,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         key_cache, value_cache = kv_cache.unbind(1)
+        mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         # Rotated-domain fast path: for single-token decode with 4-bit
         # no-outlier config, skip the Hadamard butterfly entirely by
@@ -240,6 +241,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
                 and not k_state.config.lite_mode
                 and self.alibi_slopes is None
                 and self.sliding_window == (-1, -1)
+                and mm_prefix_range_tensor is None
             )
             if use_rotated_fastpath:
                 return self._forward_turboquant_rotated(
@@ -273,7 +275,6 @@ class TurboQuantAttentionImpl(AttentionImpl):
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
         descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
-        mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         unified_attention(
             q=query[:num_actual_tokens],
