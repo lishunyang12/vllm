@@ -18,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport,
     AttentionImpl,
     AttentionLayer,
     AttentionType,
@@ -97,6 +98,18 @@ def _unpack_3bit_vectorized(
 # ---------------------------------------------------------------------------
 
 
+class TurboQuantMetadataBuilder(TritonAttentionMetadataBuilder):
+    """Metadata builder for TurboQuant attention.
+
+    Reuses the Triton metadata format but declares no full-cudagraph
+    support because TurboQuant decode uses dynamic shapes from block
+    deduplication.  The model runner will auto-downgrade to PIECEWISE,
+    where attention is a graph splitting point and decode runs eagerly.
+    """
+    _cudagraph_support: ClassVar[AttentionCGSupport] = (
+        AttentionCGSupport.NEVER)
+
+
 class TurboQuantAttentionBackend(AttentionBackend):
     """Attention backend for TurboQuant compressed KV cache."""
 
@@ -121,9 +134,8 @@ class TurboQuantAttentionBackend(AttentionBackend):
         return TurboQuantAttentionImpl
 
     @staticmethod
-    def get_builder_cls() -> type[TritonAttentionMetadataBuilder]:
-        # Reuse Triton metadata builder — same metadata format
-        return TritonAttentionMetadataBuilder
+    def get_builder_cls() -> type[TurboQuantMetadataBuilder]:
+        return TurboQuantMetadataBuilder
 
     @staticmethod
     def get_kv_cache_shape(
@@ -962,8 +974,15 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
     @torch.compiler.disable
     def _use_turboquant_block_dedup(self) -> bool:
-        """Dedup blocks only when the current forward can tolerate reshapes."""
-        from vllm.config import CUDAGraphMode
+        """Dedup blocks only when the current forward can tolerate reshapes.
+
+        In PIECEWISE cudagraph mode, attention ops are graph splitting
+        points so the TurboQuant decode path runs entirely in the eager
+        region — dynamic shapes from block dedup are safe.  Only FULL
+        mode captures the decode path inside the graph and needs
+        static shapes.
+        """
+        from vllm.config.compilation import CUDAGraphMode
         from vllm.forward_context import (
             get_forward_context,
             is_forward_context_available,
@@ -972,7 +991,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
         if not is_forward_context_available():
             return True
 
-        return get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.NONE
+        mode = get_forward_context().cudagraph_runtime_mode
+        return mode != CUDAGraphMode.FULL
 
     @torch.compiler.disable
     def _get_static_turboquant_blocks(
