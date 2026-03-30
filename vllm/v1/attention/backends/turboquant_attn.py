@@ -257,7 +257,8 @@ class TurboQuantAttentionImpl(AttentionImpl):
             ) // block_size
             trimmed_bt = block_table[:, :max_blocks_needed]
             key_cache, value_cache, block_table = self._decode_turboquant_cache(
-                key_cache, value_cache, layer, trimmed_bt
+                key_cache, value_cache, layer, trimmed_bt,
+                seq_lens=attn_metadata.seq_lens,
             )
 
         cu_seqlens_q = attn_metadata.query_start_loc
@@ -310,6 +311,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
         value_cache: torch.Tensor,
         layer: torch.nn.Module,
         block_table: torch.Tensor,
+        seq_lens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode only referenced blocks from packed uint8 to bf16.
 
@@ -322,8 +324,9 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         # Deduplicate blocks: prefix caching can make many block ids
         # repeat across requests. Decode each unique block only once.
+        # Pass seq_lens to filter out stale/padded block table entries.
         unique_block_ids, new_block_table = self._get_live_turboquant_blocks(
-            block_table, None, key_cache.shape[1],
+            block_table, seq_lens, key_cache.shape[1],
         )
         num_entries = unique_block_ids.shape[0]
 
