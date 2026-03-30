@@ -393,18 +393,18 @@ class Attention(nn.Module, AttentionLayerBase):
         # Fallback: if user only passed --kv-cache-dtype turboquant
         # without --quantization, create default TurboQuantConfig
         if kv_cache_dtype == "turboquant" and not hasattr(self, "_turboquant_config"):
-            import os
-
             from vllm.model_executor.layers.quantization.turboquant import (
                 TurboQuantConfig,
             )
 
-            tq_lite = os.environ.get("TQ_LITE", "0") in ("1", "true", "True")
-            tq_bits = int(os.environ.get("TQ_BITS", "4"))
+            tq_bits = 4
+            tq_outlier = 0.0
+            if cache_config is not None:
+                tq_bits = cache_config.turboquant_bits
+                tq_outlier = cache_config.turboquant_outlier_fraction
             self._turboquant_config = TurboQuantConfig(
                 bit_width=tq_bits,
-                outlier_fraction=0.15,
-                lite_mode=tq_lite,
+                outlier_fraction=tq_outlier,
             )
 
         # Initialize TurboQuantState eagerly (not in forward) to avoid
