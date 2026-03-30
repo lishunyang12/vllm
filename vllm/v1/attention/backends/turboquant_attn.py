@@ -227,8 +227,28 @@ class TurboQuantAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
         key_cache, value_cache = kv_cache.unbind(1)
 
-        # Decode compressed uint8 blocks → bf16.
-        # Trim block_table to only needed blocks (avoids decoding padding).
+        # Rotated-domain fast path: for single-token decode with 4-bit
+        # no-outlier config, skip the Hadamard butterfly entirely by
+        # pre-rotating Q and decoding K/V in the rotated domain.
+        if hasattr(layer, "_tq_k_state"):
+            k_state = layer._tq_k_state
+            use_rotated_fastpath = (
+                attn_metadata.max_query_len == 1
+                and int(k_state.config.bit_width) == 4
+                and int(layer._tq_v_state.config.bit_width) == 4
+                and (k_state.head_size - k_state.normal_size) == 0
+                and not k_state.config.lite_mode
+                and self.alibi_slopes is None
+                and self.sliding_window == (-1, -1)
+            )
+            if use_rotated_fastpath:
+                return self._forward_turboquant_rotated(
+                    query[:num_actual_tokens],
+                    key_cache, value_cache,
+                    output, attn_metadata, layer,
+                )
+
+        # General decode path: decompress all referenced blocks to bf16.
         block_table = attn_metadata.block_table
         if hasattr(layer, "_tq_k_state"):
             block_size = key_cache.shape[1]
@@ -294,47 +314,35 @@ class TurboQuantAttentionImpl(AttentionImpl):
         """Decode only referenced blocks from packed uint8 to bf16.
 
         Returns compact bf16 caches and remapped block_table.
-        Uses fused Triton kernel for 4-bit (single kernel: unpack → codebook
-        → inv Hadamard → norm scale → write bf16 with outlier interleaving).
+        Uses block deduplication via torch.unique to avoid decoding
+        duplicate/padded blocks. Uses fused Triton kernel for 4-bit.
         """
         k_bits = int(layer._tq_k_state.config.bit_width)
         v_bits = int(layer._tq_v_state.config.bit_width)
 
-        flat_bt = block_table.reshape(-1)
-        num_entries = flat_bt.shape[0]
-
-        # Cache the remapped block_table (same size every call in CUDA graph)
-        cache_key = (num_entries, block_table.shape[0], block_table.shape[1])
-        if not hasattr(self, "_bt_cache") or self._bt_cache[0] != cache_key:
-            self._bt_cache = (
-                cache_key,
-                torch.arange(
-                    num_entries,
-                    device=block_table.device,
-                    dtype=block_table.dtype,
-                ).reshape(block_table.shape),
-            )
-        new_block_table = self._bt_cache[1]
+        # Deduplicate blocks: prefix caching can make many block ids
+        # repeat across requests. Decode each unique block only once.
+        unique_block_ids, new_block_table = self._get_live_turboquant_blocks(
+            block_table, None, key_cache.shape[1],
+        )
+        num_entries = unique_block_ids.shape[0]
 
         if layer._tq_k_state.config.lite_mode:
             return self._decode_lite(
                 key_cache,
                 value_cache,
                 layer,
-                flat_bt,
+                unique_block_ids,
                 num_entries,
                 new_block_table,
             )
 
-        # When K and V use the same bit-width, use the fast fused path
-        # for 4-bit. With asymmetric bits, fall back to unfused which
-        # handles per-state bit_width correctly.
         if k_bits == 4 and v_bits == 4:
             return self._decode_fused_4bit(
                 key_cache,
                 value_cache,
                 layer,
-                flat_bt,
+                unique_block_ids,
                 num_entries,
                 new_block_table,
             )
@@ -343,7 +351,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
             key_cache,
             value_cache,
             layer,
-            flat_bt,
+            unique_block_ids,
             num_entries,
             new_block_table,
         )
@@ -942,3 +950,197 @@ class TurboQuantAttentionImpl(AttentionImpl):
             slot_3d = slot_data.reshape(num_actual, num_kv_heads, slot_bytes)
             cache = kv_cache[:, kv_idx]
             cache[block_indices, block_offsets] = slot_3d
+
+    # ------------------------------------------------------------------
+    # Decode optimizations
+    # ------------------------------------------------------------------
+
+    @torch.compiler.disable
+    def _get_live_turboquant_blocks(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor | None,
+        block_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return unique live block ids and a compact remapped block table.
+
+        Prefix caching can make many block ids repeat across requests,
+        and hybrid layouts can leave trailing block slots unused.
+        This deduplicates to minimize the number of blocks decoded.
+        """
+        if seq_lens is None:
+            flat_bt = block_table.reshape(-1)
+            unique_block_ids, remapped = torch.unique(
+                flat_bt, sorted=True, return_inverse=True,
+            )
+            return unique_block_ids, remapped.reshape(block_table.shape)
+
+        blocks_per_seq = torch.div(
+            seq_lens + block_size - 1, block_size, rounding_mode="floor",
+        )
+        block_positions = torch.arange(
+            block_table.shape[1], device=block_table.device,
+        )
+        valid_mask = block_positions.unsqueeze(0) < blocks_per_seq.unsqueeze(1)
+        flat_bt = block_table[valid_mask]
+        unique_block_ids, remapped = torch.unique(
+            flat_bt, sorted=True, return_inverse=True,
+        )
+        new_block_table = torch.zeros_like(block_table)
+        new_block_table[valid_mask] = remapped.to(block_table.dtype)
+        return unique_block_ids, new_block_table
+
+    @torch.compiler.disable
+    def _forward_turboquant_rotated(
+        self,
+        attn_query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        layer: torch.nn.Module,
+    ) -> torch.Tensor:
+        """Rotated-domain fast path for TurboQuant decode.
+
+        Pre-rotates Q into the TurboQuant domain and decodes K/V
+        without the Hadamard butterfly (codebook + norm only). This
+        eliminates log2(d) butterfly passes per cache position from
+        the inner decode loop.
+
+        Guard conditions (checked by caller):
+          - 4-bit K+V, no outliers
+          - max_query_len == 1 (pure decode step)
+          - No ALiBi, sliding window, sinks, or multimodal prefix
+        """
+        from vllm.v1.attention.ops.triton_decode_attention import (
+            decode_attention_fwd,
+        )
+        from vllm.v1.attention.ops.triton_hadamard_turboquant import (
+            hadamard_turboquant_decode_packed4_cache_rotated,
+            hadamard_turboquant_rotate_query,
+            hadamard_turboquant_unrotate_output,
+        )
+
+        k_state = layer._tq_k_state
+        v_state = layer._tq_v_state
+        block_table = attn_metadata.block_table
+        seq_lens = attn_metadata.seq_lens
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        packed_bytes = (
+            k_state.normal_size * int(k_state.config.bit_width) + 7
+        ) // 8
+        batch_size, num_query_heads, head_size = attn_query.shape
+
+        # Decode K/V cache in rotated domain (no Hadamard).
+        unique_k_ids, new_bt = self._get_live_turboquant_blocks(
+            block_table, seq_lens, key_cache.shape[1],
+        )
+        k_rotated = hadamard_turboquant_decode_packed4_cache_rotated(
+            key_cache, unique_k_ids, k_state.codebook,
+            head_size=k_state.normal_size,
+            packed_offset=0, norm_offset=packed_bytes,
+            output_dtype=torch.float16,
+        )
+        v_rotated = hadamard_turboquant_decode_packed4_cache_rotated(
+            value_cache, unique_k_ids, v_state.codebook,
+            head_size=v_state.normal_size,
+            packed_offset=0, norm_offset=packed_bytes,
+            output_dtype=torch.float16,
+        )
+
+        # Reshape to paged layout for decode attention kernel.
+        block_size = key_cache.shape[1]
+        num_entries = unique_k_ids.shape[0]
+        num_kv_heads = key_cache.shape[2]
+        k_paged = k_rotated.reshape(
+            num_entries, block_size, num_kv_heads, head_size,
+        )
+        v_paged = v_rotated.reshape(
+            num_entries, block_size, num_kv_heads, head_size,
+        )
+
+        # Pre-rotate Q into TurboQuant domain.
+        q_rotated = hadamard_turboquant_rotate_query(
+            attn_query, k_state.sign_flips, output_dtype=torch.float16,
+        )
+
+        # Decode-only attention in rotated domain.
+        num_kv_splits = 4
+        decode_output, lse, attn_logits = (
+            self._get_turboquant_decode_buffers(
+                layer, batch_size, num_query_heads, head_size,
+                num_kv_splits, head_size + 1,
+                torch.float16, attn_query.device,
+            )
+        )
+        decode_attention_fwd(
+            q_rotated, k_paged, v_paged,
+            decode_output, lse,
+            new_bt, seq_lens, attn_logits,
+            num_kv_splits, self.scale,
+            page_size=block_size,
+            logit_cap=self.logits_soft_cap,
+        )
+
+        # Unrotate output back to standard domain.
+        decode_output = hadamard_turboquant_unrotate_output(
+            decode_output, v_state.sign_flips,
+            output_dtype=decode_output.dtype,
+        )
+        output[:num_actual_tokens].copy_(decode_output.to(output.dtype))
+        return output
+
+    def _get_turboquant_decode_buffers(
+        self,
+        layer: torch.nn.Module,
+        batch_size: int,
+        num_query_heads: int,
+        head_size: int,
+        num_kv_splits: int,
+        logits_width: int,
+        output_dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get or create persistent decode buffers for TurboQuant.
+
+        Reuses layer-owned buffers across decode steps to avoid
+        repeated allocation overhead.
+        """
+        output_shape = (batch_size, num_query_heads, head_size)
+        lse_shape = (batch_size, num_query_heads)
+        logits_shape = (
+            batch_size, num_query_heads, num_kv_splits, logits_width,
+        )
+
+        decode_output = getattr(layer, "_tq_decode_output", None)
+        if (
+            decode_output is None
+            or decode_output.device != device
+            or decode_output.dtype != output_dtype
+            or any(
+                a < b
+                for a, b in zip(decode_output.shape, output_shape)
+            )
+        ):
+            decode_output = torch.empty(
+                output_shape, dtype=output_dtype, device=device,
+            )
+            lse = torch.empty(
+                lse_shape, dtype=torch.float32, device=device,
+            )
+            attn_logits = torch.empty(
+                logits_shape, dtype=torch.float32, device=device,
+            )
+            layer._tq_decode_output = decode_output
+            layer._tq_lse = lse
+            layer._tq_attn_logits = attn_logits
+        else:
+            lse = layer._tq_lse
+            attn_logits = layer._tq_attn_logits
+
+        return (
+            decode_output[:batch_size],
+            lse[:batch_size],
+            attn_logits[:batch_size],
+        )
