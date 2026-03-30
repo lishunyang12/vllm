@@ -199,11 +199,11 @@ def _hadamard_transform(x: Tensor) -> Tensor:
     d = x.shape[-1]
     h = 1
     while h < d:
-        # Butterfly: add/subtract pairs at distance h
-        x_even = x[..., 0 :: 2 * h].clone()
-        x_odd = x[..., h :: 2 * h].clone()
-        x[..., 0 :: 2 * h] = x_even + x_odd
-        x[..., h :: 2 * h] = x_even - x_odd
+        groups = x.reshape(*x.shape[:-1], d // (2 * h), 2, h)
+        x_even = groups[..., 0, :].clone()
+        x_odd = groups[..., 1, :].clone()
+        groups[..., 0, :] = x_even + x_odd
+        groups[..., 1, :] = x_even - x_odd
         h *= 2
     # Normalize to make it orthogonal
     x = x / math.sqrt(d)
