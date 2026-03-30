@@ -340,7 +340,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
         # repeat across requests. Decode each unique block only once.
         # Pass seq_lens to filter out stale/padded block table entries.
         unique_block_ids, new_block_table = self._get_live_turboquant_blocks(
-            block_table, seq_lens, key_cache.shape[1],
+            block_table, seq_lens, key_cache.shape[1], key_cache.shape[0],
         )
         num_entries = unique_block_ids.shape[0]
 
@@ -998,9 +998,32 @@ class TurboQuantAttentionImpl(AttentionImpl):
     def _get_static_turboquant_blocks(
         self,
         block_table: torch.Tensor,
+        seq_lens: torch.Tensor | None,
+        block_size: int,
+        num_blocks: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the original block layout with a cached identity remap."""
-        flat_bt = block_table.reshape(-1)
+        """Return a sanitized static block layout with a cached identity remap."""
+        flat_bt = block_table.reshape(-1).clone()
+
+        if seq_lens is None:
+            live_mask = torch.ones_like(flat_bt, dtype=torch.bool)
+        else:
+            blocks_per_seq = torch.div(
+                seq_lens + block_size - 1, block_size, rounding_mode="floor",
+            )
+            block_positions = torch.arange(
+                block_table.shape[1], device=block_table.device,
+            )
+            live_mask = (
+                block_positions.unsqueeze(0) < blocks_per_seq.unsqueeze(1)
+            ).reshape(-1)
+
+        valid_mask = live_mask & (flat_bt >= 0) & (flat_bt < num_blocks)
+        if not torch.all(valid_mask):
+            # Keep the flattened layout static for cudagraph replay, but avoid
+            # feeding invalid ids into the rotated Triton decode kernel.
+            flat_bt[~valid_mask] = 0
+
         cache_key = (
             block_table.shape,
             block_table.device,
@@ -1023,6 +1046,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
         block_table: torch.Tensor,
         seq_lens: torch.Tensor | None,
         block_size: int,
+        num_blocks: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return unique live block ids and a compact remapped block table.
 
@@ -1033,7 +1057,9 @@ class TurboQuantAttentionImpl(AttentionImpl):
         if not self._use_turboquant_block_dedup():
             # CUDA graph replay requires decode tensor shapes to stay fixed for
             # a captured batch shape, so keep the original block layout there.
-            return self._get_static_turboquant_blocks(block_table)
+            return self._get_static_turboquant_blocks(
+                block_table, seq_lens, block_size, num_blocks
+            )
 
         if seq_lens is None:
             flat_bt = block_table.reshape(-1)
@@ -1101,7 +1127,7 @@ class TurboQuantAttentionImpl(AttentionImpl):
 
         # Decode K/V cache in rotated domain (no Hadamard).
         unique_k_ids, new_bt = self._get_live_turboquant_blocks(
-            block_table, seq_lens, key_cache.shape[1],
+            block_table, seq_lens, key_cache.shape[1], key_cache.shape[0],
         )
         k_rotated = hadamard_turboquant_decode_packed4_cache_rotated(
             key_cache, unique_k_ids, k_state.codebook,
