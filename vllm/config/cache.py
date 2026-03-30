@@ -90,6 +90,15 @@ class CacheConfig:
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
+    turboquant_bits: int = 4
+    """Bit-width for TurboQuant KV cache quantization (1-4). Only used when
+    cache_dtype is 'turboquant'. Default 4 gives the best quality/compression
+    tradeoff. Lower values save more memory at the cost of quality."""
+    turboquant_outlier_fraction: float = 0.0
+    """Fraction of head dimensions to keep at full precision as outlier
+    channels (0.0-1.0). Only used when cache_dtype is 'turboquant'. Default
+    0.0 enables the rotated-domain decode fast path. Set to e.g. 0.15 to
+    preserve the top 15% highest-variance channels at full precision."""
     cpu_kvcache_space_bytes: int | None = None
     """(CPU backend only) CPU key-value cache space."""
     mamba_page_size_padded: int | None = None
