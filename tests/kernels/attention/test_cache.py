@@ -789,7 +789,7 @@ def test_concat_and_cache_mla(
 
 
 @pytest.mark.parametrize("kv_lora_rank", KV_LORA_RANKS)
-@pytest.mark.parametrize("qk_rope_head_dim", QK_ROPE_HEAD_DIMS)
+@pytest.mark.parametrize("qk_rope_head_dim", [0, 64])
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS_MLA)
 @pytest.mark.parametrize("block_size", BLOCK_SIZES_MLA)
 @pytest.mark.parametrize("num_blocks", NUM_BLOCKS_MLA)
@@ -824,7 +824,7 @@ def test_concat_and_cache_ds_mla(
 
     kv_c = torch.randn(num_tokens, kv_lora_rank, dtype=dtype, device=device)
     k_pe = torch.randn(num_tokens, qk_rope_head_dim, dtype=dtype, device=device)
-    entry_size = kv_lora_rank + (4 * 4) + (2 * qk_rope_head_dim)
+    entry_size = 656
 
     scale = torch.tensor(1.0, dtype=torch.float32, device=device)
     kv_cache = _create_mla_cache(
@@ -837,6 +837,9 @@ def test_concat_and_cache_ds_mla(
     )
 
     ref_cache = torch.zeros_like(kv_cache, dtype=kv_cache.dtype)
+    if qk_rope_head_dim == 0:
+        kv_cache[..., 528:].fill_(0xA5)
+        ref_cache[..., 528:].fill_(0xA5)
     tile_data = torch.zeros(128, dtype=dtype, device=device)
 
     for i in range(num_tokens):

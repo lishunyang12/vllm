@@ -326,6 +326,16 @@ def has_flashinfer_sparse_mla_sm120_config(num_q_heads: int, top_k: int) -> bool
 
 
 @functools.cache
+def has_flashinfer_sparse_mla_sm120_nope_config(num_q_heads: int, top_k: int) -> bool:
+    """Return whether FlashInfer ships an SM120 GLM NoPE specialization."""
+    if not has_flashinfer_sparse_mla_sm120():
+        return False
+    mod = _get_submodule("flashinfer.mla._sparse_mla_sm120")
+    dispatch = getattr(mod, "_DECODE_GLM53_NOPE_DISPATCH", None) if mod else None
+    return dispatch is not None and (int(num_q_heads), int(top_k)) in dispatch
+
+
+@functools.cache
 def has_flashinfer_cutedsl() -> bool:
     """Return ``True`` if FlashInfer cutedsl module is available."""
     return (

@@ -528,15 +528,17 @@ __global__ void concat_and_cache_ds_mla_kernel(
   // For the NoPE part, each tile of 128 elements is handled by half of one warp
   // (16 threads). There are 4 total tiles, so 2 warps (64 threads).
   // Lanes 0 and 16 of each warp write the scale values for that warp's tiles.
-  // The RoPE part (last 64 elements) is handled by another 1 warp (32 threads).
-  // So in total, we use 3 warps (96 threads) per block.
+  // The optional RoPE part (last 64 elements) uses one more warp.
 
   // Cast kv_cache to 16_bit for RoPE values
   scalar_t* kv_cache_16bit =
       reinterpret_cast<scalar_t*>(&kv_cache[dst_idx_start]);
 
-  // The last warp handles the RoPE part
+  // The last warp handles the optional RoPE part.
   if (threadIdx.x >= 64) {
+    if (pe_dim == 0) {
+      return;
+    }
     // Each thread handles two elements of RoPE
     const int8_t pe_idx_start = (threadIdx.x - 64) * 2;
     const int64_t src_idx = token_idx * k_pe_stride + pe_idx_start;
@@ -920,7 +922,8 @@ void concat_and_cache_mla(
   if (kv_cache_dtype == "fp8_ds_mla") {
     STD_TORCH_CHECK(kv_lora_rank == 512,
                     "kv_lora_rank must be 512 for fp8_ds_mla");
-    STD_TORCH_CHECK(pe_dim == 64, "pe_dim must be 64 for fp8_ds_mla");
+    STD_TORCH_CHECK(pe_dim == 0 || pe_dim == 64,
+                    "pe_dim must be 0 or 64 for fp8_ds_mla");
     STD_TORCH_CHECK(kv_cache.size(2) == 656 / kv_cache.element_size(),
                     "kv_cache.size(2) must be 656 bytes for fp8_ds_mla");
     STD_TORCH_CHECK(kv_c.element_size() == 2,
@@ -945,9 +948,8 @@ void concat_and_cache_mla(
     // For the NoPE part, each tile of 128 elements is handled by half of one
     // warp (16 threads). There are 4 total tiles, so 2 warps (64 threads).
     // Lanes 0 and 16 of each warp write the scale values for that warp's tiles.
-    // The RoPE part (last 64 elements) is handled by another 1 warp (32
-    // threads). So in total, we use 3 warps (96 threads) per block.
-    dim3 block(96);
+    // The optional RoPE part (last 64 elements) uses one more warp.
+    dim3 block(pe_dim == 0 ? 64 : 96);
     DISPATCH_BY_KV_CACHE_DTYPE(kv_c.scalar_type(), kv_cache_dtype,
                                CALL_CONCAT_AND_CACHE_DS_MLA);
   } else {
