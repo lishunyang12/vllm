@@ -158,6 +158,10 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
     def get_name() -> str:
         return "FLASHINFER_MLA_SPARSE_SM120"
 
+    @classmethod
+    def get_supported_head_sizes(cls) -> list[int]:
+        return [512, 576]
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [64, 256]
@@ -214,7 +218,36 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
                     "FLASHINFER_MLA_SPARSE_SM120 requires a model with "
                     "index_topk config"
                 )
-            if int(index_topk) != 2048:
+            qk_rope_head_dim = getattr(hf_text_config, "qk_rope_head_dim", None)
+            if qk_rope_head_dim == 0:
+                if head_size != 512:
+                    return (
+                        "FLASHINFER_MLA_SPARSE_SM120 native NoPE requires "
+                        f"head_size=512; got {head_size}"
+                    )
+                model_type = getattr(hf_text_config, "model_type", None)
+                if model_type is None or not model_type.startswith("glm"):
+                    return (
+                        "FLASHINFER_MLA_SPARSE_SM120 native NoPE requires a "
+                        "GLM model with arbitrary FP32 inline KV scales"
+                    )
+                kv_lora_rank = getattr(hf_text_config, "kv_lora_rank", None)
+                if kv_lora_rank != 512:
+                    return (
+                        "FLASHINFER_MLA_SPARSE_SM120 native NoPE requires "
+                        f"kv_lora_rank=512; got {kv_lora_rank}"
+                    )
+                index_kpool = getattr(hf_text_config, "index_kpool", 1) or 1
+                topk_capacity = int(index_topk) + max(int(index_kpool) - 1, 0)
+                topk_capacity = ((topk_capacity + 127) // 128) * 128
+                if topk_capacity != 2176:
+                    return (
+                        "FLASHINFER_MLA_SPARSE_SM120 native NoPE requires "
+                        "topk buffer width 2176; "
+                        f"got {topk_capacity} (index_topk={index_topk}, "
+                        f"index_kpool={index_kpool})"
+                    )
+            elif int(index_topk) != 2048:
                 return (
                     "FLASHINFER_MLA_SPARSE_SM120 requires index_topk=2048; "
                     f"got {index_topk}"
